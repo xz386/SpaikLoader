@@ -17,7 +17,7 @@
 
 ## 📥 Скачать
 
-👉 [Скачать последнюю версию](https://github.com/YOUR_USERNAME/SpaikLoader/releases)
+👉 [Скачать последнюю версию](https://github.com/xz386/SpaikLoader/releases/tag/v1.0)
 
 ---
 
