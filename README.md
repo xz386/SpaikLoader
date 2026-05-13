@@ -2,7 +2,7 @@
 
 Удобный GUI для yt-dlp • Скачивание видео и музыки с поддержкой плейлистов
 
----<img width="846" height="828" alt="Снимок экрана 2026-05-13 190044" src="https://github.com/user-attachments/assets/969540cd-e5ee-4624-b44f-335af92b04c2" />
+<img width="846" height="828" alt="Снимок экрана 2026-05-13 190044" src="https://github.com/user-attachments/assets/969540cd-e5ee-4624-b44f-335af92b04c2" />
 
 
 ## 🚀 Возможности
