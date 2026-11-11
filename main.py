@@ -4,6 +4,9 @@ import re
 import shutil
 import threading
 import subprocess
+import ssl
+import tempfile
+import zipfile
 import urllib.request
 import webbrowser
 import customtkinter as ctk
@@ -14,6 +17,22 @@ APP_NAME = "MediaLoader Pro"
 
 # ЗАМЕНИ НА СВОЮ ССЫЛКУ ДОНАТА
 DONATE_LINK = "https://dalink.to/xz386"
+
+# Источники для скачивания компонентов (проверены: отдают файл по редиректу GitHub)
+YTDLP_URLS = [
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+]
+FFMPEG_URLS = [
+    "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+]
+# yt-dlp требует JS-рантайм (Deno) для полноценной работы с YouTube
+DENO_URLS = [
+    "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip",
+]
+
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SpaikLoader"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def get_app_dir():
@@ -28,25 +47,167 @@ def resource_path(name):
     return os.path.join(get_app_dir(), name)
 
 
+def _is_writable(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        test = os.path.join(path, ".write_test")
+        with open(test, "w") as f:
+            f.write("ok")
+        os.remove(test)
+        return True
+    except Exception:
+        return False
+
+
+_BIN_DIR = None
+
+
 def bin_dir():
-    path = os.path.join(get_app_dir(), "bin")
-    os.makedirs(path, exist_ok=True)
-    return path
+    """Папка bin рядом с программой, а если туда нельзя писать
+    (например, Program Files) — %LOCALAPPDATA%\\SpaikLoader\\bin."""
+    global _BIN_DIR
+    if _BIN_DIR:
+        return _BIN_DIR
+
+    local = os.path.join(get_app_dir(), "bin")
+    if _is_writable(local):
+        _BIN_DIR = local
+    else:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        _BIN_DIR = os.path.join(base, "SpaikLoader", "bin")
+        os.makedirs(_BIN_DIR, exist_ok=True)
+    return _BIN_DIR
+
+
+def find_tool(exe_name):
+    """Ищем программу в bin, затем в PATH."""
+    path = os.path.join(bin_dir(), exe_name)
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
+        return path
+    return shutil.which(exe_name)
 
 
 def ytdlp_path():
-    return os.path.join(bin_dir(), "yt-dlp.exe")
+    return find_tool("yt-dlp.exe")
+
+
+def deno_path():
+    return find_tool("deno.exe")
 
 
 def install_ffmpeg():
+    """Копирует встроенный в exe ffmpeg (если есть) в bin и возвращает
+    папку с ffmpeg.exe или None."""
     for name in ["ffmpeg.exe", "ffprobe.exe"]:
         src = resource_path(name)
         dst = os.path.join(bin_dir(), name)
-        if os.path.exists(src) and not os.path.exists(dst):
-            shutil.copy2(src, dst)
+        try:
+            if os.path.exists(src) and not os.path.exists(dst):
+                shutil.copy2(src, dst)
+        except Exception:
+            pass
 
-    ffmpeg = os.path.join(bin_dir(), "ffmpeg.exe")
-    return bin_dir() if os.path.exists(ffmpeg) else None
+    ffmpeg = find_tool("ffmpeg.exe")
+    return os.path.dirname(ffmpeg) if ffmpeg else None
+
+
+def _ssl_contexts():
+    yield ssl.create_default_context()
+    try:
+        import certifi
+        yield ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+
+
+def _download_urllib(url, dest, progress):
+    last_error = None
+    for ctx in _ssl_contexts():
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
+                total = int(resp.headers.get("Content-Length") or 0)
+                done = 0
+                with open(dest, "wb") as f:
+                    while True:
+                        chunk = resp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+                        if progress:
+                            progress(done, total)
+            if total and done != total:
+                raise IOError(f"файл скачан не полностью ({done} из {total} байт)")
+            return
+        except ssl.SSLError as e:
+            last_error = e
+            continue
+        except urllib.error.URLError as e:
+            if isinstance(getattr(e, "reason", None), ssl.SSLError):
+                last_error = e
+                continue
+            raise
+    raise last_error
+
+
+def _download_curl(url, dest):
+    """Запасной вариант: встроенный в Windows 10/11 curl.exe
+    (использует системные сертификаты и обычно проходит там, где Python не может)."""
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if not curl:
+        raise IOError("curl не найден")
+    subprocess.run(
+        [curl, "-L", "--fail", "--retry", "3", "-A", USER_AGENT, "-o", dest, url],
+        check=True,
+        capture_output=True,
+        creationflags=NO_WINDOW,
+    )
+
+
+def download_file(urls, dest, progress=None):
+    """Скачивает первый рабочий URL во временный файл и атомарно переносит в dest."""
+    errors = []
+    tmp = dest + ".part"
+    for url in urls:
+        for method in ("urllib", "curl"):
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                if method == "urllib":
+                    _download_urllib(url, tmp, progress)
+                else:
+                    _download_curl(url, tmp)
+                if not os.path.exists(tmp) or os.path.getsize(tmp) < 1024:
+                    raise IOError("получен пустой файл")
+                os.replace(tmp, dest)
+                return
+            except Exception as e:
+                errors.append(f"{method}: {e}")
+    try:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    except Exception:
+        pass
+    raise IOError("не удалось скачать.\n" + "\n".join(errors[-4:]))
+
+
+def extract_from_zip(zip_path, names, target_dir):
+    """Достаёт из архива файлы с указанными именами (в любой подпапке)."""
+    found = set()
+    with zipfile.ZipFile(zip_path) as z:
+        for info in z.infolist():
+            base = os.path.basename(info.filename).lower()
+            if base in names and base not in found:
+                dst = os.path.join(target_dir, base)
+                tmp = dst + ".part"
+                with z.open(info) as src, open(tmp, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                os.replace(tmp, dst)
+                found.add(base)
+    missing = set(names) - found
+    if missing:
+        raise IOError("в архиве нет: " + ", ".join(sorted(missing)))
 
 
 class App(ctk.CTk):
@@ -176,12 +337,13 @@ class App(ctk.CTk):
         tools = ctk.CTkFrame(tab_main, fg_color="transparent")
         tools.pack(pady=5)
 
-        ctk.CTkButton(
+        self.tools_btn = ctk.CTkButton(
             tools,
             text="Установить / обновить yt-dlp",
             command=self.update_ytdlp,
             width=230
-        ).grid(row=0, column=0, padx=8)
+        )
+        self.tools_btn.grid(row=0, column=0, padx=8)
 
         self.tools_label = ctk.CTkLabel(tools, text="")
         self.tools_label.grid(row=0, column=1, padx=8)
@@ -330,28 +492,102 @@ class App(ctk.CTk):
         os.startfile(self.save_folder)
 
     def refresh_tools(self):
-        ff = "FFmpeg ✅" if self.ffmpeg else "FFmpeg ❌"
-        yd = "yt-dlp ✅" if os.path.exists(ytdlp_path()) else "yt-dlp ❌"
+        self.ffmpeg = install_ffmpeg()
+        has_yt = bool(ytdlp_path())
+        has_deno = bool(deno_path())
 
-        ok = self.ffmpeg and os.path.exists(ytdlp_path())
+        ff = "FFmpeg ✅" if self.ffmpeg else "FFmpeg ❌"
+        yd = "yt-dlp ✅" if has_yt else "yt-dlp ❌"
+        dn = "Deno ✅" if has_deno else "Deno ❌"
+
+        ok = self.ffmpeg and has_yt and has_deno
         self.tools_label.configure(
-            text=f"{ff} | {yd}",
+            text=f"{ff} | {yd} | {dn}",
             text_color="lightgreen" if ok else "orange"
         )
 
+    def set_status(self, text):
+        self.after(0, lambda t=text: self.status_label.configure(text=t))
+
+    def _progress_cb(self, title):
+        def cb(done, total):
+            if total:
+                p = done / total
+                self.after(0, lambda p=p: self.progress.set(p))
+                self.after(0, lambda p=p: self.percent_label.configure(text=f"{int(p * 100)}%"))
+                self.set_status(f"{title}: {done // 1048576} / {total // 1048576} МБ")
+            else:
+                self.set_status(f"{title}: {done // 1048576} МБ")
+        return cb
+
     def update_ytdlp(self):
+        """Устанавливает/обновляет yt-dlp и докачивает недостающие FFmpeg и Deno."""
+        self.tools_btn.configure(state="disabled")
+        self.download_btn.configure(state="disabled")
+
         def run():
+            errors = []
+            target = bin_dir()
+
+            # 1. yt-dlp — всегда скачиваем свежий
             try:
-                self.after(0, lambda: self.status_label.configure(text="Скачиваю yt-dlp..."))
-
-                url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
-                urllib.request.urlretrieve(url, ytdlp_path())
-
-                self.after(0, lambda: self.status_label.configure(text="yt-dlp установлен / обновлён ✅"))
-                self.after(0, self.refresh_tools)
-
+                download_file(
+                    YTDLP_URLS,
+                    os.path.join(target, "yt-dlp.exe"),
+                    self._progress_cb("Скачиваю yt-dlp")
+                )
             except Exception as e:
-                self.after(0, lambda: self.status_label.configure(text=f"Ошибка yt-dlp: {e}"))
+                errors.append(f"yt-dlp: {e}")
+
+            # 2. FFmpeg — только если его нет (архив большой, ~200 МБ)
+            if not install_ffmpeg():
+                zip_path = os.path.join(tempfile.gettempdir(), "spaikloader_ffmpeg.zip")
+                try:
+                    download_file(FFMPEG_URLS, zip_path, self._progress_cb("Скачиваю FFmpeg"))
+                    self.set_status("Распаковываю FFmpeg...")
+                    extract_from_zip(zip_path, {"ffmpeg.exe", "ffprobe.exe"}, target)
+                except Exception as e:
+                    errors.append(f"FFmpeg: {e}")
+                finally:
+                    try:
+                        os.remove(zip_path)
+                    except Exception:
+                        pass
+
+            # 3. Deno — JS-рантайм, нужен yt-dlp для YouTube
+            if not deno_path():
+                zip_path = os.path.join(tempfile.gettempdir(), "spaikloader_deno.zip")
+                try:
+                    download_file(DENO_URLS, zip_path, self._progress_cb("Скачиваю Deno"))
+                    self.set_status("Распаковываю Deno...")
+                    extract_from_zip(zip_path, {"deno.exe"}, target)
+                except Exception as e:
+                    errors.append(f"Deno: {e}")
+                finally:
+                    try:
+                        os.remove(zip_path)
+                    except Exception:
+                        pass
+
+            def finish():
+                self.refresh_tools()
+                self.progress.set(0)
+                self.percent_label.configure(text="0%")
+                self.tools_btn.configure(state="normal")
+                self.download_btn.configure(state="normal")
+                if errors:
+                    msg = "\n\n".join(errors)
+                    self.status_label.configure(text="Ошибка установки компонентов ❌")
+                    self.add_history("❌ Установка: " + msg.replace("\n", " "))
+                    messagebox.showerror(
+                        "Ошибка установки",
+                        msg + "\n\nПроверь интернет / антивирус (он может удалять yt-dlp.exe) "
+                        f"и попробуй ещё раз.\nПапка компонентов: {bin_dir()}"
+                    )
+                else:
+                    self.status_label.configure(text="Компоненты установлены / обновлены ✅")
+
+            self.after(0, finish)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -371,7 +607,7 @@ class App(ctk.CTk):
             )
 
     def start_download(self):
-        if not os.path.exists(ytdlp_path()):
+        if not ytdlp_path():
             messagebox.showwarning("yt-dlp не найден", "Нажми 'Установить / обновить yt-dlp'")
             return
 
@@ -453,6 +689,10 @@ class App(ctk.CTk):
             if self.ffmpeg:
                 cmd += ["--ffmpeg-location", self.ffmpeg]
 
+            deno = deno_path()
+            if deno:
+                cmd += ["--js-runtimes", f"deno:{deno}"]
+
             if fmt == "MP3":
                 if not self.ffmpeg:
                     raise Exception("Для MP3 нужен ffmpeg.exe")
@@ -499,15 +739,18 @@ class App(ctk.CTk):
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
 
+            last_error = ""
             for line in process.stdout:
                 line = line.strip()
                 if line:
+                    if line.startswith("ERROR:"):
+                        last_error = line[6:].strip()
                     self.parse_progress(line)
 
             code = process.wait()
 
             if code != 0:
-                raise Exception("yt-dlp завершился с ошибкой")
+                raise Exception(last_error or "yt-dlp завершился с ошибкой")
 
             self.after(0, lambda: self.progress.set(1))
             self.after(0, lambda: self.percent_label.configure(text="100%"))
@@ -517,8 +760,11 @@ class App(ctk.CTk):
             self.after(0, self.maybe_show_donate_message)
 
         except Exception as e:
-            self.after(0, lambda: self.status_label.configure(text=f"Ошибка: {e}"))
-            self.after(0, lambda: self.add_history(f"❌ {url} | {e}"))
+            # e копируем в переменную: в Python 3 она удаляется после except,
+            # и lambda, вызванная позже через after(), падала с NameError
+            err = str(e)
+            self.after(0, lambda: self.status_label.configure(text=f"Ошибка: {err[:120]}"))
+            self.after(0, lambda: self.add_history(f"❌ {url} | {err}"))
 
         finally:
             self.after(0, lambda: self.download_btn.configure(state="normal"))
