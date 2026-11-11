@@ -192,6 +192,35 @@ def download_file(urls, dest, progress=None):
     raise IOError("не удалось скачать.\n" + "\n".join(errors[-4:]))
 
 
+def latest_ytdlp_version():
+    """Последняя версия yt-dlp на GitHub (по редиректу releases/latest -> /tag/<версия>)."""
+    url = "https://github.com/yt-dlp/yt-dlp/releases/latest"
+    for ctx in _ssl_contexts():
+        try:
+            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
+                final = resp.geturl()
+            if "/tag/" in final:
+                return final.rsplit("/tag/", 1)[1].strip("/")
+        except Exception:
+            continue
+    return None
+
+
+def installed_ytdlp_version():
+    path = ytdlp_path()
+    if not path:
+        return None
+    try:
+        out = subprocess.run(
+            [path, "--version"], capture_output=True, text=True,
+            timeout=60, creationflags=NO_WINDOW
+        )
+        return out.stdout.strip() or None
+    except Exception:
+        return None
+
+
 def extract_from_zip(zip_path, names, target_dir):
     """Достаёт из архива файлы с указанными именами (в любой подпапке)."""
     found = set()
@@ -230,10 +259,15 @@ class App(ctk.CTk):
         self.save_folder = os.path.join(os.path.expanduser("~"), "Downloads")
         self.current_file = ""
         self.done_count = 0
+        self.installing = False
+        self.ytdlp_checked = False
 
         self.build_ui()
         self.bind_all("<Control-KeyPress>", self.hotkeys)
         self.refresh_tools()
+
+        # При запуске сами докачиваем недостающее и обновляем yt-dlp
+        self.after(500, lambda: self.install_components(on_done=lambda ok: None))
 
     def build_ui(self):
         tabs = ctk.CTkTabview(self, width=810, height=760)
@@ -339,7 +373,7 @@ class App(ctk.CTk):
 
         self.tools_btn = ctk.CTkButton(
             tools,
-            text="Установить / обновить yt-dlp",
+            text="Обновить yt-dlp / FFmpeg / Deno",
             command=self.update_ytdlp,
             width=230
         )
@@ -521,7 +555,17 @@ class App(ctk.CTk):
         return cb
 
     def update_ytdlp(self):
-        """Устанавливает/обновляет yt-dlp и докачивает недостающие FFmpeg и Deno."""
+        """Кнопка: скачать последние версии всех компонентов."""
+        self.install_components(force=True)
+
+    def install_components(self, force=False, on_done=None):
+        """Скачивает компоненты в фоне.
+        force=True  — перекачать последние версии всего (yt-dlp, FFmpeg, Deno);
+        force=False — скачать только недостающее и обновить yt-dlp, если вышла новая версия.
+        on_done(ok) вызывается в потоке интерфейса по окончании."""
+        if self.installing:
+            return
+        self.installing = True
         self.tools_btn.configure(state="disabled")
         self.download_btn.configure(state="disabled")
 
@@ -529,18 +573,26 @@ class App(ctk.CTk):
             errors = []
             target = bin_dir()
 
-            # 1. yt-dlp — всегда скачиваем свежий
-            try:
-                download_file(
-                    YTDLP_URLS,
-                    os.path.join(target, "yt-dlp.exe"),
-                    self._progress_cb("Скачиваю yt-dlp")
-                )
-            except Exception as e:
-                errors.append(f"yt-dlp: {e}")
+            # 1. yt-dlp — качаем, если нет, если force или вышла новая версия
+            need_yt = force or not ytdlp_path()
+            if not need_yt:
+                self.set_status("Проверяю обновления yt-dlp...")
+                latest = latest_ytdlp_version()
+                current = installed_ytdlp_version()
+                need_yt = bool(latest and current and latest != current)
+            if need_yt:
+                try:
+                    download_file(
+                        YTDLP_URLS,
+                        os.path.join(target, "yt-dlp.exe"),
+                        self._progress_cb("Скачиваю последнюю версию yt-dlp")
+                    )
+                except Exception as e:
+                    errors.append(f"yt-dlp: {e}")
+            self.ytdlp_checked = True
 
-            # 2. FFmpeg — только если его нет (архив большой, ~200 МБ)
-            if not install_ffmpeg():
+            # 2. FFmpeg (архив ~200 МБ)
+            if force or not install_ffmpeg():
                 zip_path = os.path.join(tempfile.gettempdir(), "spaikloader_ffmpeg.zip")
                 try:
                     download_file(FFMPEG_URLS, zip_path, self._progress_cb("Скачиваю FFmpeg"))
@@ -555,7 +607,7 @@ class App(ctk.CTk):
                         pass
 
             # 3. Deno — JS-рантайм, нужен yt-dlp для YouTube
-            if not deno_path():
+            if force or not deno_path():
                 zip_path = os.path.join(tempfile.gettempdir(), "spaikloader_deno.zip")
                 try:
                     download_file(DENO_URLS, zip_path, self._progress_cb("Скачиваю Deno"))
@@ -570,11 +622,18 @@ class App(ctk.CTk):
                         pass
 
             def finish():
+                self.installing = False
                 self.refresh_tools()
                 self.progress.set(0)
                 self.percent_label.configure(text="0%")
                 self.tools_btn.configure(state="normal")
                 self.download_btn.configure(state="normal")
+                if not errors:
+                    self.status_label.configure(text="Компоненты готовы ✅")
+                if on_done:
+                    on_done(not errors)
+                    if not errors:
+                        return
                 if errors:
                     msg = "\n\n".join(errors)
                     self.status_label.configure(text="Ошибка установки компонентов ❌")
@@ -606,14 +665,30 @@ class App(ctk.CTk):
                 "Если программа тебе полезна — можешь поддержать проект во вкладке 'Поддержать ❤️'."
             )
 
-    def start_download(self):
-        if not ytdlp_path():
-            messagebox.showwarning("yt-dlp не найден", "Нажми 'Установить / обновить yt-dlp'")
-            return
-
+    def start_download(self, skip_install=False):
         url = self.url_entry.get().strip()
         if not url:
             self.status_label.configure(text="Вставь ссылку")
+            return
+
+        if self.installing:
+            self.status_label.configure(text="Подожди, идёт установка компонентов...")
+            return
+
+        # Нет компонентов или yt-dlp ещё не проверялся на обновление в этом запуске —
+        # сначала сами скачиваем последние версии, потом сразу начинаем загрузку.
+        need_mp3_ffmpeg = self.format_box.get() == "MP3" and not self.ffmpeg
+        needs = not ytdlp_path() or not deno_path() or need_mp3_ffmpeg or not self.ytdlp_checked
+        if needs and not skip_install:
+            def after_install(ok):
+                # Даже если что-то второстепенное не скачалось, но yt-dlp есть — качаем.
+                if ytdlp_path():
+                    self.start_download(skip_install=True)
+            self.install_components(on_done=after_install)
+            return
+
+        if not ytdlp_path():
+            messagebox.showwarning("yt-dlp не найден", "Не удалось скачать yt-dlp. Проверь интернет и нажми 'Обновить'.")
             return
 
         self.download_btn.configure(state="disabled")
